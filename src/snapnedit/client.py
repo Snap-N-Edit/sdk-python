@@ -39,6 +39,10 @@ from .models import (
     UnsetType,
     UploadResult,
     UrlInput,
+    UsageGroupBy,
+    UsageInstant,
+    UsageReport,
+    UsageSource,
 )
 
 __all__ = ["Snapnedit"]
@@ -346,6 +350,8 @@ class Snapnedit:
                 download=view.download,
                 output=output,
                 mime=output_mime,
+                credit_cost=view.credit_cost,
+                cached=view.cached,
             )
         return RunResult(
             job_id=view.job_id,
@@ -354,6 +360,8 @@ class Snapnedit:
             destination=view.destination,
             delivery=view.delivery,
             download=view.download,
+            credit_cost=view.credit_cost,
+            cached=view.cached,
         )
 
     def download_result(self, source: JobView | RunResult | SignedUrl | str) -> bytes:
@@ -371,6 +379,51 @@ class Snapnedit:
     def _download(self, signed: SignedUrl | str) -> tuple[bytes, str]:
         response = self.send(ep.download(signed))
         return response.content, response.headers.get("content-type", "application/octet-stream")
+
+    # -- usage -------------------------------------------------------------
+
+    def get_usage(
+        self,
+        *,
+        start: UsageInstant | None = None,
+        end: UsageInstant | None = None,
+        group_by: UsageGroupBy | None = None,
+        key_id: str | None = None,
+        origin: str | None = None,
+        operation: str | None = None,
+        source: UsageSource | None = None,
+    ) -> UsageReport:
+        """`GET /usage` — jobs, credits and embed sessions over a date range.
+
+        Args:
+            start: Inclusive window start (the wire's `from`). An ISO string, a
+                `date` (the whole UTC day) or a `datetime`. Defaults to 30 days
+                before `end`.
+            end: Inclusive window end (the wire's `to`). Defaults to now. A
+                window wider than 366 days is refused with `invalid_input`.
+            group_by: How `series` is bucketed — `"day"` (the default, zero-filled
+                and oldest first), `"key"`, `"origin"`, `"operation"` or
+                `"source"`. Everything but `day` comes back busiest first.
+            key_id: Only jobs authenticated with this api key.
+            origin: Only embed jobs from this host surface.
+            operation: Only jobs for this operation id.
+            source: Only jobs that arrived this way.
+
+        Readable with a secret key or an embed token. An embed token is scoped
+        to its own key — `key_id` is ignored for it and `report.keys` is empty.
+        """
+        payload, url, _ = self._json(
+            ep.get_usage(
+                start=start,
+                end=end,
+                group_by=group_by,
+                key_id=key_id,
+                origin=origin,
+                operation=operation,
+                source=source,
+            )
+        )
+        return ep.parse_usage(payload, url)
 
 
 class DestinationsClient:

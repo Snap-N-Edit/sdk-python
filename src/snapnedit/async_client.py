@@ -44,6 +44,10 @@ from .models import (
     UnsetType,
     UploadResult,
     UrlInput,
+    UsageGroupBy,
+    UsageInstant,
+    UsageReport,
+    UsageSource,
 )
 
 __all__ = ["AsyncSnapnedit"]
@@ -290,6 +294,8 @@ class AsyncSnapnedit:
                 download=view.download,
                 output=output,
                 mime=output_mime,
+                credit_cost=view.credit_cost,
+                cached=view.cached,
             )
         return RunResult(
             job_id=view.job_id,
@@ -298,6 +304,8 @@ class AsyncSnapnedit:
             destination=view.destination,
             delivery=view.delivery,
             download=view.download,
+            credit_cost=view.credit_cost,
+            cached=view.cached,
         )
 
     async def download_result(self, source: JobView | RunResult | SignedUrl | str) -> bytes:
@@ -315,6 +323,33 @@ class AsyncSnapnedit:
     async def _download(self, signed: SignedUrl | str) -> tuple[bytes, str]:
         response = await self.send(ep.download(signed))
         return response.content, response.headers.get("content-type", "application/octet-stream")
+
+    # -- usage -------------------------------------------------------------
+
+    async def get_usage(
+        self,
+        *,
+        start: UsageInstant | None = None,
+        end: UsageInstant | None = None,
+        group_by: UsageGroupBy | None = None,
+        key_id: str | None = None,
+        origin: str | None = None,
+        operation: str | None = None,
+        source: UsageSource | None = None,
+    ) -> UsageReport:
+        """`GET /usage`. See :meth:`snapnedit.Snapnedit.get_usage`."""
+        payload, url, _ = await self._json(
+            ep.get_usage(
+                start=start,
+                end=end,
+                group_by=group_by,
+                key_id=key_id,
+                origin=origin,
+                operation=operation,
+                source=source,
+            )
+        )
+        return ep.parse_usage(payload, url)
 
 
 class AsyncDestinationsClient:

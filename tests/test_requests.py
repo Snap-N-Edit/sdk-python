@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -12,9 +14,11 @@ import pytest
 from _fake import FakeApi, create_body, job_body, upload_routes
 from snapnedit import (
     AsyncSnapnedit,
+    ErrorCode,
     PresignedPutDestination,
     SavedDestination,
     Snapnedit,
+    SnapneditError,
     UrlInput,
 )
 
@@ -392,3 +396,124 @@ def test_params_are_passed_through_verbatim(factor: str):
     with client(api) as snap:
         snap.create_job("upscale", "asset-in", {"factor": factor})
     assert api.sent("POST", "/jobs")[0].json["params"] == {"factor": factor}
+
+
+def usage_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "range": {"from": "2026-08-14T00:00:00.000Z", "to": "2026-09-13T23:59:59.999Z"},
+        "groupBy": "operation",
+        "totals": {
+            "jobs": 3,
+            "credits": 4,
+            "cacheHits": 1,
+            "free": 1,
+            "failed": 0,
+            "delivered": 2,
+            "deliveryFailed": 0,
+            "sessions": 5,
+            "activeSessions": 2,
+        },
+        "series": [
+            {
+                "key": "upscale",
+                "label": "upscale",
+                "jobs": 2,
+                "credits": 4,
+                "cacheHits": 1,
+                "free": 0,
+                "failed": 0,
+                "delivered": 2,
+                "deliveryFailed": 0,
+                "sessions": 0,
+            }
+        ],
+        "keys": [
+            {
+                "id": "key-1",
+                "name": "server",
+                "kind": "secret",
+                "dailyCreditLimit": None,
+                "usedToday": 4,
+            }
+        ],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_get_usage_sends_no_query_when_nothing_is_asked_for():
+    api = FakeApi().on("GET", "/usage", json_body=usage_body())
+    with client(api) as snap:
+        report = snap.get_usage()
+    assert api.sent("GET", "/usage")[0].url == "http://api.test/usage"
+    assert report.group_by == "operation"
+    assert report.totals.jobs == 3
+    assert report.totals.active_sessions == 2
+    assert report.range.start == "2026-08-14T00:00:00.000Z"
+    point = report.point("upscale")
+    assert point is not None
+    assert (point.credits, point.cache_hits, point.delivery_failed) == (4, 1, 0)
+    assert report.keys[0].daily_credit_limit is None
+    assert report.keys[0].used_today == 4
+
+
+def test_get_usage_builds_the_query_string_in_wire_spelling():
+    api = FakeApi().on("GET", "/usage", json_body=usage_body())
+    with client(api) as snap:
+        snap.get_usage(
+            start=date(2026, 9, 1),
+            end=datetime(2026, 9, 13, 12, 30, tzinfo=timezone.utc),
+            group_by="operation",
+            key_id="key-1",
+            origin="https://app.example",
+            operation="upscale",
+            source="api",
+        )
+    query = urlparse(api.sent("GET", "/usage")[0].url).query
+    assert parse_qs(query) == {
+        "from": ["2026-09-01"],
+        "to": ["2026-09-13T12:30:00Z"],
+        "groupBy": ["operation"],
+        "keyId": ["key-1"],
+        "origin": ["https://app.example"],
+        "operation": ["upscale"],
+        "source": ["api"],
+    }
+
+
+def test_get_usage_treats_a_naive_datetime_as_utc_and_normalizes_an_aware_one():
+    api = FakeApi().on("GET", "/usage", json_body=usage_body())
+    with client(api) as snap:
+        snap.get_usage(start=datetime(2026, 9, 1, 6, 0))
+        snap.get_usage(start=datetime(2026, 9, 1, 8, 0, tzinfo=timezone(timedelta(hours=2))))
+    sent = [parse_qs(urlparse(r.url).query)["from"][0] for r in api.sent("GET", "/usage")]
+    assert sent == ["2026-09-01T06:00:00Z", "2026-09-01T06:00:00Z"]
+
+
+def test_get_usage_normalizes_a_missing_keys_roster_to_an_empty_list():
+    body = usage_body()
+    del body["keys"]
+    api = FakeApi().on("GET", "/usage", json_body=body)
+    with client(api) as snap:
+        assert snap.get_usage().keys == []
+
+
+def test_get_usage_rejects_an_unknown_group_by():
+    api = FakeApi().on("GET", "/usage", json_body=usage_body(groupBy="galaxy"))
+    with client(api) as snap, pytest.raises(SnapneditError) as caught:
+        snap.get_usage()
+    assert caught.value.code is ErrorCode.INTERNAL
+
+
+def test_the_async_client_reads_usage_too():
+    api = FakeApi().on("GET", "/usage", json_body=usage_body())
+
+    async def main() -> None:
+        async with AsyncSnapnedit(
+            "sk_test", "http://api.test", transport=api.async_transport
+        ) as snap:
+            report = await snap.get_usage(group_by="day")
+            assert report.totals.credits == 4
+
+    asyncio.run(main())
+    assert parse_qs(urlparse(api.sent("GET", "/usage")[0].url).query) == {"groupBy": ["day"]}

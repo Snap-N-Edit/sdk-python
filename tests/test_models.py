@@ -201,3 +201,41 @@ def test_image_inputs_are_read_and_sniffed(tmp_path):
 
     with pytest.raises(SnapneditError):
         read_image(b"")
+
+
+def test_the_billing_fields_are_parsed_off_a_job_body():
+    job = view(creditCost=2, cached=True, deliveryOnly=True)
+    assert (job.credit_cost, job.cached, job.delivery_only) == (2, True, True)
+
+    # An api that predates them sends none, which can only mean "nothing billed".
+    plain = view()
+    assert (plain.credit_cost, plain.cached, plain.delivery_only) == (0, False, False)
+
+    created = CreateJobResult.from_wire(
+        {
+            "jobId": "job-1",
+            "status": {"state": "succeeded", "outputAssetId": "o", "download": None},
+            "input": {"kind": "asset"},
+            "destination": None,
+            "delivery": None,
+            "creditCost": 0,
+            "cached": True,
+            "deliveryOnly": False,
+        },
+        "POST /jobs",
+        200,
+    )
+    assert created.cached is True
+    assert created.credit_cost == 0
+    assert created.as_view().cached is True
+
+    # A 200 is a cache hit even from an api that does not say so.
+    legacy = CreateJobResult.from_wire(
+        {
+            "jobId": "job-2",
+            "status": {"state": "succeeded", "outputAssetId": "o", "download": None},
+        },
+        "POST /jobs",
+        200,
+    )
+    assert legacy.cached is True

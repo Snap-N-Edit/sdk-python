@@ -33,6 +33,12 @@ with Snapnedit(api_key="sk_live_…") as snap:
 Prefer the pieces? `snap.upload(...)`, `snap.create_job(...)`, `snap.get_job(id)`,
 `snap.wait_for_job(id)` and `snap.download_result(job)` are all public.
 
+Every job — created, polled or run — also reports what it cost: `credit_cost` (0 for a free
+operation, a cache hit or an unmetered caller), `cached` (served from the result cache
+rather than by running a model) and, on `create_job()` / `get_job()`, `delivery_only` (a job
+that exists only to deliver an already-cached result somewhere new). A cache hit records its
+own job row, so its `job_id` is a **new** id sharing the earlier job's `output_asset_id`.
+
 ## Async
 
 ```python
@@ -114,6 +120,46 @@ snap.destinations.delete(dest.id)
 One destination per account can be the **default**, applied automatically to any job that
 names none. `destination=None` opts a single job out of it; omitting the argument entirely
 means "apply my default". Those are different requests, and the SDK keeps them different.
+
+## Usage and credits
+
+`snap.get_usage()` reports what the account has actually spent — jobs, credits, cache hits,
+deliveries and embedded-editor sessions — bucketed along one dimension at a time.
+
+```python
+report = snap.get_usage(group_by="operation")          # last 30 days by default
+
+print(report.range.start, report.range.end)            # the resolved window, ISO instants
+print(report.totals.jobs, report.totals.credits)       # 41 68
+print(report.totals.cache_hits, report.totals.free)    # requests that ran no model / cost nothing
+
+for point in report.series:                            # busiest first (oldest first for "day")
+    print(point.key, point.label, point.jobs, point.credits)
+
+for key in report.keys:                                # today's spend against each key's cap
+    print(key.name, key.kind, key.used_today, "/", key.daily_credit_limit or "∞")
+```
+
+```python
+from datetime import date
+
+september = snap.get_usage(
+    start=date(2026, 9, 1),            # the wire's `from`; a `datetime` works too
+    end=date(2026, 9, 30),             # the wire's `to`, inclusive
+    group_by="day",                    # "day" | "key" | "origin" | "operation" | "source"
+    source="embed",                    # plus keyId / origin / operation filters
+)
+print(september.point("2026-09-13"))   # one bucket by key, or None
+```
+
+`group_by="day"` is zero-filled across the whole range so a chart has a point per day;
+every other grouping comes back busiest first. `jobs` counts REQUESTS — a cache hit is a
+job too — while `credits` is what was actually debited, so a free operation, a cache hit
+and a website job all contribute `0`. A range wider than 366 days is refused with
+`invalid_input`.
+
+An embed token may read its own numbers: the api scopes the report to that token's key and
+omits the key roster, which the SDK normalizes to `report.keys == []`.
 
 ## Webhooks
 

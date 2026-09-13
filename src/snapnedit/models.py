@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from typing import Any, Literal
 
 from ._wire import (
@@ -29,6 +30,7 @@ from .errors import ErrorCode
 
 __all__ = [
     "UNSET",
+    "USAGE_UNATTRIBUTED",
     "CreateJobResult",
     "Destination",
     "DestinationPresign",
@@ -49,12 +51,39 @@ __all__ = [
     "UnsetType",
     "UploadResult",
     "UrlInput",
+    "UsageGroupBy",
+    "UsageInstant",
+    "UsageKeyRow",
+    "UsageRange",
+    "UsageReport",
+    "UsageSeriesPoint",
+    "UsageSource",
+    "UsageTotals",
 ]
 
 JobState = Literal["queued", "processing", "succeeded", "failed", "canceled"]
 DeliveryStatus = Literal["pending", "delivered", "failed"]
 StorageProvider = Literal["aws-s3", "cloudflare-r2", "backblaze-b2", "s3-compatible"]
 DestinationExt = Literal["png", "jpg", "webp", "avif", "svg", "pdf", "gif"]
+UsageGroupBy = Literal["day", "key", "origin", "operation", "source"]
+"""The dimension `GET /usage` buckets its series along."""
+UsageSource = Literal["api", "embed", "session", "anonymous"]
+"""How a job was requested, as the api persists it. `session` and `anonymous` are never billed."""
+
+UsageInstant = str | date | datetime
+"""What `get_usage()` accepts for a range end: an ISO string, a `date` or a `datetime`.
+
+A `date` is sent as `YYYY-MM-DD` (which the api reads as the whole UTC day); a
+`datetime` is normalized to UTC and sent as an instant, a naive one being taken
+as already UTC.
+"""
+
+USAGE_UNATTRIBUTED = "none"
+"""The series key for a bucket with no value for the grouped dimension.
+
+A website job has no api key, an `sk_` job has no origin — both land here
+rather than being dropped from the series.
+"""
 
 _TERMINAL: frozenset[str] = frozenset({"succeeded", "failed", "canceled"})
 
@@ -318,11 +347,23 @@ class JobStatus:
 
 @dataclass(frozen=True)
 class JobEnvelope:
-    """The bring-your-own-storage half of a job: input kind, destination, delivery."""
+    """Everything a job response carries beside its status.
+
+    The bring-your-own-storage half (input kind, destination, delivery) plus
+    the billing facts `GET /usage` aggregates: what the request cost, whether
+    it was served from the cache, and whether it exists only to deliver a
+    cached result somewhere new.
+    """
 
     input: JobInput
     destination: JobDestinationSummary | None
     delivery: JobDelivery | None
+    credit_cost: int = 0
+    """Credits debited for this job. 0 for a free op, a cache hit or an unmetered caller."""
+    cached: bool = False
+    """True when the result was served from the cache rather than by running a provider."""
+    delivery_only: bool = False
+    """True for a job that exists only to deliver an already-cached result to a new destination."""
 
     @classmethod
     def from_wire(cls, data: Mapping[str, Any]) -> JobEnvelope:
@@ -330,7 +371,7 @@ class JobEnvelope:
 
         Deliberately lenient: an api that predates bring-your-own-storage sends
         none of these keys, and that can only mean an asset input with no
-        destination.
+        destination, nothing billed and no cache hit.
         """
         raw_input = opt_mapping(data.get("input"))
         kind: Literal["asset", "url"] = (
@@ -340,6 +381,9 @@ class JobEnvelope:
             input=JobInput(kind=kind),
             destination=JobDestinationSummary.from_wire(data.get("destination")),
             delivery=JobDelivery.from_wire(data.get("delivery")),
+            credit_cost=opt_int(data, "creditCost") or 0,
+            cached=opt_bool(data, "cached") or False,
+            delivery_only=opt_bool(data, "deliveryOnly") or False,
         )
 
 
@@ -352,6 +396,12 @@ class JobView:
     input: JobInput
     destination: JobDestinationSummary | None
     delivery: JobDelivery | None
+    credit_cost: int = 0
+    """Credits debited for this job. 0 for a free op, a cache hit or an unmetered caller."""
+    cached: bool = False
+    """True when the result was served from the cache rather than by running a provider."""
+    delivery_only: bool = False
+    """True for a job that exists only to deliver an already-cached result to a new destination."""
 
     @property
     def state(self) -> JobState:
@@ -414,6 +464,9 @@ def _envelope_kwargs(envelope: JobEnvelope) -> dict[str, Any]:
         "input": envelope.input,
         "destination": envelope.destination,
         "delivery": envelope.delivery,
+        "credit_cost": envelope.credit_cost,
+        "cached": envelope.cached,
+        "delivery_only": envelope.delivery_only,
     }
 
 
@@ -427,11 +480,17 @@ class CreateJobResult:
     destination: JobDestinationSummary | None
     delivery: JobDelivery | None
     http_status: int = 202
+    credit_cost: int = 0
+    """Credits debited for this request. 0 for a free op, a cache hit or an unmetered caller."""
+    cached: bool = False
+    """True for a free cache hit — the api answered `200`, already `succeeded`.
 
-    @property
-    def cached(self) -> bool:
-        """True when the api answered `200` — a free cache hit, already `succeeded`."""
-        return self.http_status == 200
+    A cache hit still creates a NEW job row (so usage can count what was
+    asked for as well as what ran), so `job_id` is a new id with the SAME
+    `output_asset_id` as the job whose result it reuses.
+    """
+    delivery_only: bool = False
+    """True for a job that exists only to deliver an already-cached result to a new destination."""
 
     @property
     def state(self) -> JobState:
@@ -446,17 +505,26 @@ class CreateJobResult:
             input=self.input,
             destination=self.destination,
             delivery=self.delivery,
+            credit_cost=self.credit_cost,
+            cached=self.cached,
+            delivery_only=self.delivery_only,
         )
 
     @classmethod
     def from_wire(cls, value: object, source: str, http_status: int) -> CreateJobResult:
         """Parse a `POST /jobs` body."""
         data = req_mapping(value, source)
+        envelope = JobEnvelope.from_wire(data)
+        kwargs = _envelope_kwargs(envelope)
+        # A `200` IS the cache hit, whatever the body says: the status code is
+        # the older, narrower signal and an api that predates `cached` sends
+        # only that.
+        kwargs["cached"] = envelope.cached or http_status == 200
         return cls(
             job_id=req_str(data, "jobId", source),
             status=JobStatus.from_wire(data.get("status"), source),
             http_status=http_status,
-            **_envelope_kwargs(JobEnvelope.from_wire(data)),
+            **kwargs,
         )
 
 
@@ -486,6 +554,10 @@ class RunResult:
     download: SignedUrl | None = None
     output: bytes | None = None
     mime: str | None = None
+    credit_cost: int = 0
+    """Credits debited for this job. 0 for a free op, a cache hit or an unmetered caller."""
+    cached: bool = False
+    """True when the result was served from the cache rather than by running a provider."""
 
 
 @dataclass(frozen=True)
@@ -518,6 +590,177 @@ class OperationMetadata:
             description=req_str(data, "description", source),
             seo_title=req_str(data, "seoTitle", source),
         )
+
+
+# --------------------------------------------------------------------------
+# usage
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UsageRange:
+    """The window `GET /usage` actually reported on, as ISO-8601 instants.
+
+    `start` and `end` are the wire's `from` and `to` — renamed only because
+    `from` is a Python keyword. They are INSTANTS, not the `YYYY-MM-DD` the
+    query accepts: slice the first ten characters for the day.
+    """
+
+    start: str
+    end: str
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> UsageRange:
+        """Parse `{ from, to }`."""
+        data = req_mapping(value, source, "range")
+        return cls(start=req_str(data, "from", source), end=req_str(data, "to", source))
+
+
+@dataclass(frozen=True)
+class UsageTotals:
+    """The whole range, undivided.
+
+    `jobs` counts REQUESTS — a cache hit is a job too — and `credits` is what
+    was actually debited, so a free operation, a cache hit and a website job
+    all add 0. `sessions` counts embedded-editor sessions started in the range,
+    `active_sessions` those last seen within it.
+    """
+
+    jobs: int
+    credits: int
+    cache_hits: int
+    free: int
+    failed: int
+    delivered: int
+    delivery_failed: int
+    sessions: int
+    active_sessions: int
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> UsageTotals:
+        """Parse the `totals` object."""
+        data = req_mapping(value, source, "totals")
+        return cls(
+            **_usage_facts(data, source),
+            sessions=req_int(data, "sessions", source),
+            active_sessions=req_int(data, "activeSessions", source),
+        )
+
+
+@dataclass(frozen=True)
+class UsageSeriesPoint:
+    """One bucket of the series — a day, an api key, an origin, an operation or a source.
+
+    `key` is the dimension value (:data:`USAGE_UNATTRIBUTED` when the row has
+    none) and `label` is what to show a human: the api key's NAME for
+    `group_by="key"`, otherwise the key itself. `sessions` is always 0 for a
+    series grouped by operation or source, which sessions have no dimension for.
+    """
+
+    key: str
+    label: str
+    jobs: int
+    credits: int
+    cache_hits: int
+    free: int
+    failed: int
+    delivered: int
+    delivery_failed: int
+    sessions: int
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> UsageSeriesPoint:
+        """Parse one `series` entry."""
+        data = req_mapping(value, source, "series[]")
+        return cls(
+            key=req_str(data, "key", source),
+            label=req_str(data, "label", source),
+            **_usage_facts(data, source),
+            sessions=req_int(data, "sessions", source),
+        )
+
+
+@dataclass(frozen=True)
+class UsageKeyRow:
+    """One of the account's live api keys, with today's spend against its cap."""
+
+    id: str
+    name: str
+    kind: Literal["secret", "publishable"]
+    daily_credit_limit: int | None
+    """Publishable keys only: the per-UTC-day credit ceiling. `None` means uncapped."""
+    used_today: int
+    """Credits this key has spent so far TODAY (UTC), whatever range was requested."""
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> UsageKeyRow:
+        """Parse one `keys` entry."""
+        data = req_mapping(value, source, "keys[]")
+        kind: Literal["secret", "publishable"] = (
+            "publishable" if data.get("kind") == "publishable" else "secret"
+        )
+        return cls(
+            id=req_str(data, "id", source),
+            name=req_str(data, "name", source),
+            kind=kind,
+            daily_credit_limit=opt_int(data, "dailyCreditLimit"),
+            used_today=req_int(data, "usedToday", source),
+        )
+
+
+@dataclass(frozen=True)
+class UsageReport:
+    """`GET /usage`: what the account has spent, bucketed along one dimension.
+
+    `keys` is empty for an embed token — the api omits the roster entirely for
+    a credential that may not enumerate the account's other keys, and this
+    client normalizes that absence to an empty list.
+    """
+
+    range: UsageRange
+    group_by: UsageGroupBy
+    totals: UsageTotals
+    series: list[UsageSeriesPoint]
+    keys: list[UsageKeyRow] = field(default_factory=list)
+
+    def point(self, key: str) -> UsageSeriesPoint | None:
+        """Return the series bucket named `key`, or `None` when the range has none."""
+        return next((entry for entry in self.series if entry.key == key), None)
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> UsageReport:
+        """Parse a `GET /usage` body."""
+        data = req_mapping(value, source)
+        group_by = data.get("groupBy")
+        if group_by not in ("day", "key", "origin", "operation", "source"):
+            raise malformed(source, f"unknown usage groupBy: {group_by!r}")
+        raw_keys = data.get("keys")
+        return cls(
+            range=UsageRange.from_wire(data.get("range"), source),
+            group_by=group_by,
+            totals=UsageTotals.from_wire(data.get("totals"), source),
+            series=[
+                UsageSeriesPoint.from_wire(entry, source)
+                for entry in req_list(data.get("series"), source, "series")
+            ],
+            keys=[
+                UsageKeyRow.from_wire(entry, source)
+                for entry in (raw_keys if isinstance(raw_keys, list) else [])
+            ],
+        )
+
+
+def _usage_facts(data: Mapping[str, Any], source: str) -> dict[str, int]:
+    """Parse the seven counters every usage bucket carries."""
+    return {
+        "jobs": req_int(data, "jobs", source),
+        "credits": req_int(data, "credits", source),
+        "cache_hits": req_int(data, "cacheHits", source),
+        "free": req_int(data, "free", source),
+        "failed": req_int(data, "failed", source),
+        "delivered": req_int(data, "delivered", source),
+        "delivery_failed": req_int(data, "deliveryFailed", source),
+    }
 
 
 @dataclass(frozen=True)

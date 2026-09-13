@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "snapnedit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Official Python client for the snapnedit AI photo-editing API."
 readme = "README.md"
 requires-python = ">=3.10"

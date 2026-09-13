@@ -8,7 +8,9 @@ the async surface pick up.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import date, datetime, timezone
 from typing import Any
+from urllib.parse import urlencode
 
 from ._transport import Request
 from ._wire import req_list, req_mapping, req_str
@@ -25,6 +27,10 @@ from .models import (
     StorageDestination,
     UnsetType,
     UrlInput,
+    UsageGroupBy,
+    UsageInstant,
+    UsageReport,
+    UsageSource,
     destination_to_wire,
 )
 
@@ -39,6 +45,7 @@ __all__ = [
     "delete_destination",
     "download",
     "get_job",
+    "get_usage",
     "list_destinations",
     "list_operations",
     "parse_confirm_upload",
@@ -51,6 +58,7 @@ __all__ = [
     "parse_embed_token",
     "parse_job",
     "parse_operations",
+    "parse_usage",
     "presign_destination_upload",
     "render_design",
     "test_destination",
@@ -189,6 +197,64 @@ def download(signed: SignedUrl | str) -> Request:
         resolve="url",
         idempotent=True,
     )
+
+
+# --------------------------------------------------------------------------
+# usage
+# --------------------------------------------------------------------------
+
+
+def usage_instant(value: UsageInstant) -> str:
+    """Render a range end for the query string.
+
+    A `date` stays a bare `YYYY-MM-DD` — the api reads that as the whole UTC
+    day, which is what a caller naming a day means. A `datetime` becomes an
+    instant in UTC; a naive one is taken as already UTC rather than guessed at,
+    so the same code reports the same window on every machine.
+    """
+    if isinstance(value, datetime):
+        at = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+def get_usage(
+    *,
+    start: UsageInstant | None = None,
+    end: UsageInstant | None = None,
+    group_by: UsageGroupBy | None = None,
+    key_id: str | None = None,
+    origin: str | None = None,
+    operation: str | None = None,
+    source: UsageSource | None = None,
+) -> Request:
+    """`GET /usage` — jobs, credits and embed sessions over a range.
+
+    Every argument is optional; the api defaults to the last 30 days grouped by
+    day. `start` and `end` are the wire's `from` and `to`.
+    """
+    query: list[tuple[str, str]] = [
+        (name, value)
+        for name, value in (
+            ("from", None if start is None else usage_instant(start)),
+            ("to", None if end is None else usage_instant(end)),
+            ("groupBy", group_by),
+            ("keyId", key_id),
+            ("origin", origin),
+            ("operation", operation),
+            ("source", source),
+        )
+        if value is not None and value != ""
+    ]
+    suffix = f"?{urlencode(query)}" if query else ""
+    return Request("GET", f"/usage{suffix}")
+
+
+def parse_usage(payload: Any, url: str) -> UsageReport:
+    """Parse the usage report."""
+    return UsageReport.from_wire(payload, url)
 
 
 # --------------------------------------------------------------------------

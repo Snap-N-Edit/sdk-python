@@ -3,6 +3,27 @@
 All notable changes to the snapnedit Python SDK. This project follows
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-09-13
+
+### Added
+
+- `get_usage()` on both clients (`GET /usage`): jobs, credits, cache hits, deliveries and
+  embedded-editor sessions over a date range, bucketed by `day`, `key`, `origin`,
+  `operation` or `source`, with `key_id` / `origin` / `operation` / `source` filters.
+  `start` and `end` (the wire's `from` and `to`) accept an ISO string, a `date` or a
+  `datetime`.
+- `UsageReport`, `UsageRange`, `UsageTotals`, `UsageSeriesPoint`, `UsageKeyRow`,
+  `UsageGroupBy`, `UsageSource`, `UsageInstant` and `USAGE_UNATTRIBUTED`.
+- `credit_cost`, `cached` and `delivery_only` on `JobView` / `CreateJobResult` (and
+  `credit_cost` / `cached` on `RunResult`), read from the job responses.
+- `usage.query` in the conformance suite (25 scenarios).
+
+### Changed
+
+- `CreateJobResult.cached` is now the api's own `cached` flag, falling back to "the api
+  answered 200" for an older deployment. It was a property; it is now a field, with the
+  same meaning.
+
 ## [0.1.0] — 2026-09-13
 
 First release.

@@ -19,7 +19,7 @@ import hmac
 import json
 import re
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, TypeVar
 
 import pytest
@@ -62,6 +62,16 @@ def in_the_future(timestamp: str) -> bool:
     """Return whether an ISO-8601 timestamp is still ahead of us."""
     parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     return parsed > datetime.now(timezone.utc)
+
+
+def instant(timestamp: str) -> datetime:
+    """Parse an ISO-8601 timestamp, tolerating the `Z` suffix."""
+    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
+def in_the_past_or_now(timestamp: str) -> bool:
+    """Return whether an ISO-8601 timestamp has already happened."""
+    return instant(timestamp) <= datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------- auth ----
@@ -254,6 +264,8 @@ def test_jobs_credit_debit(conformance: Conformance, scenario_id: str):
     asset = snap.upload(conformance.unique_image("debit")).asset_id
     created = snap.create_job("remove-background", asset)
     assert created.http_status == 202
+    assert created.cached is False
+    assert created.credit_cost == 1
     # The debit lands at creation time, before the worker ever sees the job.
     assert conformance.balance() == before - 1
     assert snap.wait_for_job(created.job_id, **POLL).state == "succeeded"
@@ -272,7 +284,11 @@ def test_jobs_cache_hit(conformance: Conformance, scenario_id: str):
     second = snap.create_job("remove-background", asset)
     assert second.http_status == 200
     assert second.cached is True
+    assert second.credit_cost == 0
     assert second.state == "succeeded"
+    # A cache hit records its own job row, so the id is NEW and only the
+    # result is shared. Never assert the two ids match.
+    assert second.job_id != first.job_id
     assert second.status.output_asset_id == done.output_asset_id
     assert conformance.balance() == before
 
@@ -575,6 +591,80 @@ def test_jobs_foreign_job_is_404(conformance: Conformance, scenario_id: str):
     assert caught.value.code is ErrorCode.NOT_FOUND
 
 
+# ----------------------------------------------------------------- usage --
+
+
+@scenario("usage.query")
+def test_usage_query(conformance: Conformance, scenario_id: str):
+    snap = conformance.client()
+
+    # One paid job and one free one, on bytes nobody has submitted before: a
+    # cache hit would be free and would not move `credits`.
+    paid = snap.run("upscale", conformance.unique_image("usage-paid"), **POLL)
+    assert paid.job_id
+    free = snap.run("resize-image", conformance.unique_image("usage-free"), {"width": 4}, **POLL)
+    assert free.job_id
+
+    report = snap.get_usage(group_by="operation")
+    assert report.group_by == "operation"
+    assert in_the_past_or_now(report.range.start)
+    assert instant(report.range.end) >= instant(report.range.start)
+
+    # Every scenario shares one seeded account, so these are lower bounds.
+    assert report.totals.jobs >= 2
+    assert report.totals.credits >= 2
+    assert report.totals.free >= 1
+    for name in ("cache_hits", "failed", "delivered", "delivery_failed", "sessions",
+                 "active_sessions"):
+        value = getattr(report.totals, name)
+        assert isinstance(value, int) and value >= 0, name
+
+    upscale = report.point("upscale")
+    resize = report.point("resize-image")
+    assert upscale is not None, "no upscale bucket"
+    assert resize is not None, "no resize-image bucket"
+    # A per-operation bucket's credits is jobs x cost, so with N upscales the
+    # honest assertion is "a multiple of 2, at least 2".
+    assert upscale.credits >= 2
+    assert upscale.credits % 2 == 0
+    assert resize.credits == 0
+    for entry in report.series:
+        assert entry.key and isinstance(entry.label, str)
+        for name in ("jobs", "credits", "cache_hits", "free", "failed", "delivered",
+                     "delivery_failed", "sessions"):
+            assert isinstance(getattr(entry, name), int), f"{entry.key}.{name}"
+
+    # The cap gauge — an `sk_` caller sees every live key on the account.
+    assert len(report.keys) >= 2
+    for key in report.keys:
+        assert key.id and key.name
+        assert key.kind in ("secret", "publishable")
+        assert key.daily_credit_limit is None or isinstance(key.daily_credit_limit, int)
+        assert key.used_today >= 0
+
+    by_day = snap.get_usage(group_by="day")
+    assert by_day.group_by == "day"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert by_day.point(today) is not None
+
+    with pytest.raises(SnapneditError) as unauthorized:
+        conformance.client(None).get_usage()
+    assert unauthorized.value.status == 401
+    assert unauthorized.value.code is ErrorCode.UNAUTHORIZED
+
+    with pytest.raises(SnapneditError) as backwards:
+        snap.get_usage(start=date(2026, 9, 13), end=date(2026, 9, 1))
+    assert backwards.value.status == 400
+    assert backwards.value.code is ErrorCode.INVALID_INPUT
+
+    # The query really is the wire's `from`/`to`, spelled out over raw HTTP.
+    raw = conformance.raw.get(
+        "/usage", params={"from": "2026-09-13", "to": "2026-09-01"}, headers=auth(conformance)
+    )
+    assert raw.status_code == 400
+    assert raw.json()["error"]["code"] == "invalid_input"
+
+
 @scenario("errors.envelope")
 def test_errors_envelope(conformance: Conformance, scenario_id: str):
     responses = [
@@ -752,4 +842,4 @@ def test_every_scenario_in_scenarios_json_is_implemented(scenarios: dict[str, An
     """A new scenario upstream shows up here as a red test, not as silence."""
     assert scenarios["version"] == 1
     assert sorted(IMPLEMENTED) == sorted(entry["id"] for entry in scenarios["scenarios"])
-    assert len(IMPLEMENTED) == 24
+    assert len(IMPLEMENTED) == 25
