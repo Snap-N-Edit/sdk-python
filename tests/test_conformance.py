@@ -712,7 +712,7 @@ def test_uploads_unsupported_mime(conformance: Conformance, scenario_id: str):
     assert caught.value.code is ErrorCode.UNSUPPORTED_MIME
 
     accepted = sorted({mime for op in snap.list_operations() for mime in op.accept})
-    assert accepted == ["image/jpeg", "image/png", "image/webp"]
+    assert accepted == ["image/avif", "image/heic", "image/heif", "image/jpeg", "image/png", "image/webp"]
 
 
 # ---------------------------------------------------------------- embed --
