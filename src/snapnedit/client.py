@@ -26,11 +26,15 @@ from ._version import __version__
 from .errors import ErrorCode, SnapneditError
 from .models import (
     UNSET,
+    Account,
     CreateJobResult,
     Destination,
     DestinationPresign,
     DestinationTestResult,
     EmbedToken,
+    JobListItem,
+    JobPriority,
+    JobState,
     JobView,
     OperationMetadata,
     RunResult,
@@ -43,6 +47,9 @@ from .models import (
     UsageInstant,
     UsageReport,
     UsageSource,
+    WebhookEndpoint,
+    WebhookEndpointCreated,
+    WebhookEndpointEvent,
 )
 
 __all__ = ["Snapnedit"]
@@ -76,6 +83,8 @@ class Snapnedit:
     """Embed tokens: `create_session` (publishable key) and `create_token` (api key)."""
     designs: DesignsClient
     """Declarative designs: `create`, `create_pages`, `render`."""
+    webhook_endpoints: WebhookEndpointsClient
+    """Webhook endpoints: list, create, set_active, delete, rotate_secret."""
 
     def __init__(
         self,
@@ -114,6 +123,7 @@ class Snapnedit:
         self.destinations = DestinationsClient(self)
         self.embed = EmbedClient(self)
         self.designs = DesignsClient(self)
+        self.webhook_endpoints = WebhookEndpointsClient(self)
 
     # -- plumbing ----------------------------------------------------------
 
@@ -261,6 +271,25 @@ class Snapnedit:
         payload, url, _ = self._json(ep.get_job(job_id))
         return ep.parse_job(payload, url, job_id)
 
+    def list_jobs(
+        self,
+        *,
+        limit: int = 20,
+        status: JobState | None = None,
+        priority: JobPriority | None = None,
+    ) -> list[JobListItem]:
+        """`GET /jobs?limit=` — the account's newest jobs, newest first.
+
+        Args:
+            limit: 1-100; anything else is refused with `invalid_input`.
+            status: Only jobs in this state.
+            priority: Only jobs on this lane (`"interactive"` or `"background"`).
+
+        Secret key only. Each item is a :class:`JobView` plus `created_at`.
+        """
+        payload, url, _ = self._json(ep.list_jobs(limit=limit, status=status, priority=priority))
+        return ep.parse_job_list(payload, url)
+
     def wait_for_job(
         self,
         job_id: str,
@@ -352,6 +381,7 @@ class Snapnedit:
                 mime=output_mime,
                 credit_cost=view.credit_cost,
                 cached=view.cached,
+                test=view.test,
             )
         return RunResult(
             job_id=view.job_id,
@@ -362,6 +392,7 @@ class Snapnedit:
             download=view.download,
             credit_cost=view.credit_cost,
             cached=view.cached,
+            test=view.test,
         )
 
     def download_result(self, source: JobView | RunResult | SignedUrl | str) -> bytes:
@@ -424,6 +455,58 @@ class Snapnedit:
             )
         )
         return ep.parse_usage(payload, url)
+
+    # -- account -----------------------------------------------------------
+
+    def get_account(self) -> Account:
+        """`GET /account` — the account, its credit balance and the calling key's mode.
+
+        Secret key only: an embed token or no credential is `401 unauthorized`.
+        `account.key.mode` is `"test"` for an `sk_test_` key.
+        """
+        payload, url, _ = self._json(ep.get_account())
+        return ep.parse_account(payload, url)
+
+
+class WebhookEndpointsClient:
+    """Webhook endpoint management — `client.webhook_endpoints`. Secret key only."""
+
+    def __init__(self, client: Snapnedit) -> None:
+        """Bind to its parent client."""
+        self._client = client
+
+    def list(self) -> list[WebhookEndpoint]:
+        """`GET /webhook-endpoints` — every endpoint, never a signing secret."""
+        payload, url, _ = self._client._json(ep.list_webhook_endpoints())
+        return ep.parse_webhook_endpoint_list(payload, url)
+
+    def create(
+        self, url: str, *, events: Sequence[WebhookEndpointEvent] | UnsetType = UNSET
+    ) -> WebhookEndpointCreated:
+        """`POST /webhook-endpoints` — register an `https` url.
+
+        Omit `events` to subscribe to all of them. The returned `secret` is
+        shown only here (and on :meth:`rotate_secret`): store it to verify
+        deliveries with :meth:`snapnedit.Webhooks.verify`.
+        """
+        payload, source, _ = self._client._json(ep.create_webhook_endpoint(url, events))
+        return ep.parse_webhook_endpoint_created(payload, source)
+
+    def set_active(self, endpoint_id: str, active: bool) -> WebhookEndpoint:
+        """`PATCH /webhook-endpoints/{id}` — pause (`False`) or resume (`True`) deliveries."""
+        payload, url, _ = self._client._json(
+            ep.set_webhook_endpoint_active(endpoint_id, active)
+        )
+        return ep.parse_webhook_endpoint(payload, url)
+
+    def delete(self, endpoint_id: str) -> None:
+        """`DELETE /webhook-endpoints/{id}` — 204. An unknown id is `404 not_found`."""
+        self._client.send(ep.delete_webhook_endpoint(endpoint_id))
+
+    def rotate_secret(self, endpoint_id: str) -> str:
+        """`POST /webhook-endpoints/{id}/rotate` — returns the new signing secret."""
+        payload, url, _ = self._client._json(ep.rotate_webhook_secret(endpoint_id))
+        return ep.parse_webhook_secret(payload, url)
 
 
 class DestinationsClient:

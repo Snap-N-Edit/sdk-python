@@ -517,3 +517,111 @@ def test_the_async_client_reads_usage_too():
 
     asyncio.run(main())
     assert parse_qs(urlparse(api.sent("GET", "/usage")[0].url).query) == {"groupBy": ["day"]}
+
+
+def account_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "accountId": "acct-1",
+        "email": None,
+        "plan": "free",
+        "credits": 42,
+        "key": {"id": "key-1", "mode": "test"},
+    }
+    body.update(overrides)
+    return body
+
+
+def endpoint_body(**overrides: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "id": "we-1",
+        "accountId": "acct-1",
+        "url": "https://hooks.example/x",
+        "events": ["job.succeeded", "job.failed", "session.ended"],
+        "active": True,
+        "createdAt": "2026-11-25T00:00:00.000Z",
+        "updatedAt": "2026-11-25T00:00:00.000Z",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_get_account_reads_the_key_mode_and_a_null_email():
+    api = FakeApi().on("GET", "/account", json_body=account_body())
+    with client(api) as snap:
+        me = snap.get_account()
+    assert (me.account_id, me.email, me.plan, me.credits) == ("acct-1", None, "free", 42)
+    assert (me.key.id, me.key.mode) == ("key-1", "test")
+
+
+def test_list_jobs_always_sends_a_limit_and_parses_items_as_job_views():
+    item = job_body(jobId="job-9", createdAt="2026-11-25T00:00:00.000Z", test=True)
+    api = FakeApi().on("GET", "/jobs", json_body={"jobs": [item]})
+    with client(api) as snap:
+        jobs = snap.list_jobs()
+        snap.list_jobs(limit=5, status="failed", priority="background")
+    first, second = api.sent("GET", "/jobs")
+    assert parse_qs(urlparse(first.url).query) == {"limit": ["20"]}
+    assert parse_qs(urlparse(second.url).query) == {
+        "limit": ["5"], "status": ["failed"], "priority": ["background"]
+    }
+    assert jobs[0].job_id == "job-9"
+    assert jobs[0].created_at == "2026-11-25T00:00:00.000Z"
+    assert jobs[0].state == "succeeded"
+    assert jobs[0].test is True
+
+
+def test_the_test_flag_is_read_leniently_from_every_job_response():
+    api = (
+        FakeApi()
+        .on("POST", "/jobs", status=202, json_body=create_body(test=True))
+        .on("GET", "/jobs/job-1", json_body=job_body())
+    )
+    with client(api) as snap:
+        assert snap.create_job("upscale", "asset-in").test is True
+        assert snap.get_job("job-1").test is False  # absent on an older server
+
+
+def test_webhook_endpoint_crud_paths_and_bodies():
+    api = (
+        FakeApi()
+        .on("GET", "/webhook-endpoints", json_body={"endpoints": [endpoint_body()]})
+        .on("POST", "/webhook-endpoints", status=201,
+            json_body={"endpoint": endpoint_body(), "secret": "whsec_a"})
+        .on("PATCH", "/webhook-endpoints/we-1", json_body={"endpoint": endpoint_body(active=False)})
+        .on("DELETE", "/webhook-endpoints/we-1", status=204, content=b"")
+        .on("POST", "/webhook-endpoints/we-1/rotate", json_body={"secret": "whsec_b"})
+    )
+    with client(api) as snap:
+        hooks = snap.webhook_endpoints
+        assert [e.id for e in hooks.list()] == ["we-1"]
+        created = hooks.create("https://hooks.example/x")
+        hooks.create("https://hooks.example/x", events=["session.ended"])
+        assert created.secret == "whsec_a"
+        assert created.endpoint.account_id == "acct-1"
+        assert hooks.set_active("we-1", False).active is False
+        hooks.delete("we-1")
+        assert hooks.rotate_secret("we-1") == "whsec_b"
+
+    omitted, named = api.sent("POST", "/webhook-endpoints")
+    assert omitted.json == {"url": "https://hooks.example/x"}
+    assert named.json == {"url": "https://hooks.example/x", "events": ["session.ended"]}
+    assert api.sent("PATCH", "/webhook-endpoints/we-1")[0].json == {"active": False}
+
+
+def test_the_async_client_has_the_partner_surface_too():
+    api = (
+        FakeApi()
+        .on("GET", "/account", json_body=account_body())
+        .on("GET", "/jobs", json_body={"jobs": []})
+        .on("POST", "/webhook-endpoints/we-1/rotate", json_body={"secret": "whsec_b"})
+    )
+
+    async def main() -> None:
+        async with AsyncSnapnedit(
+            "sk_test", "http://api.test", transport=api.async_transport
+        ) as snap:
+            assert (await snap.get_account()).key.mode == "test"
+            assert await snap.list_jobs(limit=3) == []
+            assert await snap.webhook_endpoints.rotate_secret("we-1") == "whsec_b"
+
+    asyncio.run(main())

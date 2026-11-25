@@ -3,6 +3,33 @@
 All notable changes to the snapnedit Python SDK. This project follows
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-11-25
+
+### Added
+
+- `get_account()` on both clients (`GET /account`): the account id, email, plan, credit
+  balance and the calling key's id and `mode` (`"live"` or `"test"`). Secret key only.
+- `list_jobs(limit=20, status=…, priority=…)` on both clients (`GET /jobs?limit=`): the
+  newest jobs first, each a `JobListItem` — a `JobView` plus `created_at`.
+- `webhook_endpoints.list/create/set_active/delete/rotate_secret` (`/webhook-endpoints`):
+  register, pause, delete and re-key webhook urls. `create()` and `rotate_secret()` are the
+  only calls that return a signing secret.
+- `test` on `JobView` / `CreateJobResult` / `JobListItem` / `RunResult` / `WebhookJobData`:
+  `True` for a job made with an `sk_test_` key (free, placeholder result). Read leniently;
+  an older server's jobs read as `False`.
+- The `session.ended` webhook event, parsed into `WebhookSessionData`.
+- `Account`, `AccountKey`, `JobListItem`, `JobState`, `JobPriority`, `WebhookEndpoint`,
+  `WebhookEndpointCreated`, `WebhookEndpointEvent`, `WebhookEndpointsClient`,
+  `AsyncWebhookEndpointsClient` and `WebhookSessionData`.
+- `account.get`, `jobs.list`, `webhook-endpoints.crud` and `keys.test-mode` in the
+  conformance suite (29 scenarios), which now reads `testApiKey` from the ready line.
+
+### Changed
+
+- `WebhookEvent.data` is now `WebhookJobData | WebhookSessionData | None`: a `job.*`
+  event still parses to `WebhookJobData`, a `session.*` one to `WebhookSessionData`, and
+  an event type this version does not know to `None` (read `raw`) instead of raising.
+
 ## [0.1.1] — 2026-09-13
 
 ### Added

@@ -31,11 +31,15 @@ from ._version import __version__
 from .errors import ErrorCode, SnapneditError
 from .models import (
     UNSET,
+    Account,
     CreateJobResult,
     Destination,
     DestinationPresign,
     DestinationTestResult,
     EmbedToken,
+    JobListItem,
+    JobPriority,
+    JobState,
     JobView,
     OperationMetadata,
     RunResult,
@@ -48,6 +52,9 @@ from .models import (
     UsageInstant,
     UsageReport,
     UsageSource,
+    WebhookEndpoint,
+    WebhookEndpointCreated,
+    WebhookEndpointEvent,
 )
 
 __all__ = ["AsyncSnapnedit"]
@@ -80,6 +87,8 @@ class AsyncSnapnedit:
     """Embed tokens: `create_session` (publishable key) and `create_token` (api key)."""
     designs: AsyncDesignsClient
     """Declarative designs: `create`, `create_pages`, `render`."""
+    webhook_endpoints: AsyncWebhookEndpointsClient
+    """Webhook endpoints: list, create, set_active, delete, rotate_secret."""
 
     def __init__(
         self,
@@ -104,6 +113,7 @@ class AsyncSnapnedit:
         self.destinations = AsyncDestinationsClient(self)
         self.embed = AsyncEmbedClient(self)
         self.designs = AsyncDesignsClient(self)
+        self.webhook_endpoints = AsyncWebhookEndpointsClient(self)
 
     # -- plumbing ----------------------------------------------------------
 
@@ -230,6 +240,19 @@ class AsyncSnapnedit:
         payload, url, _ = await self._json(ep.get_job(job_id))
         return ep.parse_job(payload, url, job_id)
 
+    async def list_jobs(
+        self,
+        *,
+        limit: int = 20,
+        status: JobState | None = None,
+        priority: JobPriority | None = None,
+    ) -> list[JobListItem]:
+        """`GET /jobs?limit=`. See :meth:`snapnedit.Snapnedit.list_jobs`."""
+        payload, url, _ = await self._json(
+            ep.list_jobs(limit=limit, status=status, priority=priority)
+        )
+        return ep.parse_job_list(payload, url)
+
     async def wait_for_job(
         self,
         job_id: str,
@@ -296,6 +319,7 @@ class AsyncSnapnedit:
                 mime=output_mime,
                 credit_cost=view.credit_cost,
                 cached=view.cached,
+                test=view.test,
             )
         return RunResult(
             job_id=view.job_id,
@@ -306,6 +330,7 @@ class AsyncSnapnedit:
             download=view.download,
             credit_cost=view.credit_cost,
             cached=view.cached,
+            test=view.test,
         )
 
     async def download_result(self, source: JobView | RunResult | SignedUrl | str) -> bytes:
@@ -350,6 +375,49 @@ class AsyncSnapnedit:
             )
         )
         return ep.parse_usage(payload, url)
+
+    # -- account -----------------------------------------------------------
+
+    async def get_account(self) -> Account:
+        """`GET /account`. See :meth:`snapnedit.Snapnedit.get_account`."""
+        payload, url, _ = await self._json(ep.get_account())
+        return ep.parse_account(payload, url)
+
+
+class AsyncWebhookEndpointsClient:
+    """Webhook endpoint management — `client.webhook_endpoints`. Secret key only."""
+
+    def __init__(self, client: AsyncSnapnedit) -> None:
+        """Bind to its parent client."""
+        self._client = client
+
+    async def list(self) -> list[WebhookEndpoint]:
+        """`GET /webhook-endpoints` — every endpoint, never a signing secret."""
+        payload, url, _ = await self._client._json(ep.list_webhook_endpoints())
+        return ep.parse_webhook_endpoint_list(payload, url)
+
+    async def create(
+        self, url: str, *, events: Sequence[WebhookEndpointEvent] | UnsetType = UNSET
+    ) -> WebhookEndpointCreated:
+        """`POST /webhook-endpoints`. See :meth:`snapnedit.WebhookEndpointsClient.create`."""
+        payload, source, _ = await self._client._json(ep.create_webhook_endpoint(url, events))
+        return ep.parse_webhook_endpoint_created(payload, source)
+
+    async def set_active(self, endpoint_id: str, active: bool) -> WebhookEndpoint:
+        """`PATCH /webhook-endpoints/{id}` — pause (`False`) or resume (`True`) deliveries."""
+        payload, url, _ = await self._client._json(
+            ep.set_webhook_endpoint_active(endpoint_id, active)
+        )
+        return ep.parse_webhook_endpoint(payload, url)
+
+    async def delete(self, endpoint_id: str) -> None:
+        """`DELETE /webhook-endpoints/{id}` — 204. An unknown id is `404 not_found`."""
+        await self._client.send(ep.delete_webhook_endpoint(endpoint_id))
+
+    async def rotate_secret(self, endpoint_id: str) -> str:
+        """`POST /webhook-endpoints/{id}/rotate` — returns the new signing secret."""
+        payload, url, _ = await self._client._json(ep.rotate_webhook_secret(endpoint_id))
+        return ep.parse_webhook_secret(payload, url)
 
 
 class AsyncDestinationsClient:

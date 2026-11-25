@@ -71,6 +71,8 @@ class Conformance:
     bucket: str
     raw: httpx.Client
     root: Path
+    test_api_key: str = ""
+    """An `sk_test_` key on the same seeded account (empty on an older server)."""
     _clients: list[Snapnedit] = field(default_factory=list)
 
     # -- clients -----------------------------------------------------------
@@ -205,6 +207,7 @@ def conformance() -> Iterator[Conformance]:
         bucket=config.get("bucket", "conformance-bucket"),
         raw=raw,
         root=root,
+        test_api_key=config.get("testApiKey", ""),
     )
     try:
         yield helper

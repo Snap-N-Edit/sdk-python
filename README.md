@@ -32,6 +32,8 @@ with Snapnedit(api_key="sk_live_…") as snap:
 
 Prefer the pieces? `snap.upload(...)`, `snap.create_job(...)`, `snap.get_job(id)`,
 `snap.wait_for_job(id)` and `snap.download_result(job)` are all public.
+`snap.list_jobs(limit=20, status="succeeded")` returns the account's newest jobs (newest
+first; `limit` is 1-100), each a `JobView` plus `created_at`.
 
 Every job — created, polled or run — also reports what it cost: `credit_cost` (0 for a free
 operation, a cache hit or an unmetered caller), `cached` (served from the result cache
@@ -161,10 +163,36 @@ and a website job all contribute `0`. A range wider than 366 days is refused wit
 An embed token may read its own numbers: the api scopes the report to that token's key and
 omits the key roster, which the SDK normalizes to `report.keys == []`.
 
-## Webhooks
+## Account and test keys
 
 ```python
-from snapnedit import Webhooks
+me = snap.get_account()                  # secret key only; an embed token is 401
+print(me.account_id, me.plan, me.credits, me.key.mode)   # mode is "live" or "test"
+```
+
+An `sk_test_…` key runs jobs for free on placeholder results and never touches the result
+cache; every job it creates reports `test=True` (`job.test`, `result.test`). Test keys are
+capped at 50 jobs a day.
+
+## Webhooks
+
+Register endpoints with a secret key:
+
+```python
+created = snap.webhook_endpoints.create("https://example.com/hooks/snapnedit")
+ENDPOINT_SECRET = created.secret         # shown only here and on rotate_secret()
+# events default to ["job.succeeded", "job.failed", "session.ended"]
+
+snap.webhook_endpoints.list()                            # never includes a secret
+snap.webhook_endpoints.set_active(created.endpoint.id, False)   # pause deliveries
+new_secret = snap.webhook_endpoints.rotate_secret(created.endpoint.id)
+snap.webhook_endpoints.delete(created.endpoint.id)
+```
+
+Then verify each delivery:
+
+```python
+from snapnedit import WebhookJobData, Webhooks, WebhookSessionData
 
 @app.post("/hooks/snapnedit")
 def hook(request):
@@ -173,10 +201,16 @@ def hook(request):
     if not Webhooks.verify(raw, sig, ENDPOINT_SECRET, tolerance_seconds=300):
         return "bad signature", 400
     event = Webhooks.construct_event(raw, sig, ENDPOINT_SECRET)
-    if event.type == "job.succeeded":
+    if event.type == "job.succeeded" and isinstance(event.data, WebhookJobData):
         print(event.data.job_id, event.data.output_asset_id, event.data.download)
+    elif event.type == "session.ended" and isinstance(event.data, WebhookSessionData):
+        print(event.data.session_id, event.data.jobs, event.data.credits)
     return "", 204
 ```
+
+`event.data` is a `WebhookJobData` for `job.*` events, a `WebhookSessionData` for
+`session.ended` (one embedded-editor session's jobs, credits and refreshes), and `None` for
+an event type this SDK version does not know yet — read `event.raw` for those.
 
 `verify()` returns `False` — it never raises — for a malformed header, a bad signature or a
 stale timestamp, so every falsy result can be handled the same way. `construct_event()`

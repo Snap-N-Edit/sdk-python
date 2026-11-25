@@ -39,6 +39,7 @@ __all__ = [
     "WEBHOOK_SIGNATURE_HEADER",
     "WebhookEvent",
     "WebhookJobData",
+    "WebhookSessionData",
     "Webhooks",
     "construct_event",
     "verify",
@@ -70,6 +71,8 @@ class WebhookJobData:
     download: str | None = None
     error_code: str | None = None
     message: str | None = None
+    test: bool = False
+    """True for a job made with an `sk_test_` key (absent on older servers: `False`)."""
 
     @classmethod
     def from_wire(cls, value: object, source: str) -> WebhookJobData:
@@ -87,6 +90,44 @@ class WebhookJobData:
             download=opt_str(data, "download"),
             error_code=opt_str(data, "errorCode"),
             message=opt_str(data, "message"),
+            test=envelope.test,
+        )
+
+
+@dataclass(frozen=True)
+class WebhookSessionData:
+    """The `data` object of a `session.ended` event: one embedded-editor session, totalled.
+
+    `jobs` and `credits` count what the session ran and spent; `refreshes` how
+    many times its token was silently re-minted.
+    """
+
+    status: str
+    session_id: str
+    api_key_id: str | None
+    origin: str | None
+    end_user_id: str | None
+    started_at: str
+    ended_at: str
+    refreshes: int
+    jobs: int
+    credits: int
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> WebhookSessionData:
+        """Parse the `data` object of a `session.ended` delivery."""
+        data = req_mapping(value, source, "data")
+        return cls(
+            status=opt_str(data, "status") or "ended",
+            session_id=req_str(data, "sessionId", source),
+            api_key_id=opt_str(data, "apiKeyId"),
+            origin=opt_str(data, "origin"),
+            end_user_id=opt_str(data, "endUserId"),
+            started_at=req_str(data, "startedAt", source),
+            ended_at=req_str(data, "endedAt", source),
+            refreshes=opt_int(data, "refreshes") or 0,
+            jobs=opt_int(data, "jobs") or 0,
+            credits=opt_int(data, "credits") or 0,
         )
 
 
@@ -94,25 +135,35 @@ class WebhookJobData:
 class WebhookEvent:
     """One delivery body: `{ id, type, created, data }`.
 
-    `type` is deliberately an open string (`job.succeeded`, `job.failed`, …) —
-    treat an unrecognized one as a forward-compatible no-op.
+    `type` is deliberately an open string (`job.succeeded`, `job.failed`,
+    `session.ended`, …) — treat an unrecognized one as a forward-compatible
+    no-op. `data` is a :class:`WebhookJobData` for a `job.*` event, a
+    :class:`WebhookSessionData` for a `session.*` one, and `None` for a type
+    this version does not know (read `raw` instead); parsing never raises on
+    an unknown type.
     """
 
     id: str
     type: str
     created: int
-    data: WebhookJobData
+    data: WebhookJobData | WebhookSessionData | None
     raw: dict[str, Any]
 
     @classmethod
     def from_wire(cls, value: object, source: str) -> WebhookEvent:
         """Parse a delivery body."""
         body = req_mapping(value, source)
+        kind = req_str(body, "type", source)
+        data: WebhookJobData | WebhookSessionData | None = None
+        if kind.startswith("job."):
+            data = WebhookJobData.from_wire(body.get("data"), source)
+        elif kind.startswith("session."):
+            data = WebhookSessionData.from_wire(body.get("data"), source)
         return cls(
             id=req_str(body, "id", source),
-            type=req_str(body, "type", source),
+            type=kind,
             created=opt_int(body, "created") or 0,
-            data=WebhookJobData.from_wire(body.get("data"), source),
+            data=data,
             raw=dict(body),
         )
 

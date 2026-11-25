@@ -31,6 +31,8 @@ from .errors import ErrorCode
 __all__ = [
     "UNSET",
     "USAGE_UNATTRIBUTED",
+    "Account",
+    "AccountKey",
     "CreateJobResult",
     "Destination",
     "DestinationPresign",
@@ -39,6 +41,9 @@ __all__ = [
     "JobDelivery",
     "JobDestinationSummary",
     "JobInput",
+    "JobListItem",
+    "JobPriority",
+    "JobState",
     "JobStatus",
     "JobView",
     "OperationMetadata",
@@ -59,9 +64,16 @@ __all__ = [
     "UsageSeriesPoint",
     "UsageSource",
     "UsageTotals",
+    "WebhookEndpoint",
+    "WebhookEndpointCreated",
+    "WebhookEndpointEvent",
 ]
 
 JobState = Literal["queued", "processing", "succeeded", "failed", "canceled"]
+JobPriority = Literal["interactive", "background"]
+"""The queue lane a job ran on; `list_jobs()` can filter by it."""
+WebhookEndpointEvent = Literal["job.succeeded", "job.failed", "session.ended"]
+"""An event a webhook endpoint can subscribe to."""
 DeliveryStatus = Literal["pending", "delivered", "failed"]
 StorageProvider = Literal["aws-s3", "cloudflare-r2", "backblaze-b2", "s3-compatible"]
 DestinationExt = Literal["png", "jpg", "webp", "avif", "svg", "pdf", "gif"]
@@ -364,6 +376,8 @@ class JobEnvelope:
     """True when the result was served from the cache rather than by running a provider."""
     delivery_only: bool = False
     """True for a job that exists only to deliver an already-cached result to a new destination."""
+    test: bool = False
+    """True for a job made with an `sk_test_` key: free, and the result is a placeholder."""
 
     @classmethod
     def from_wire(cls, data: Mapping[str, Any]) -> JobEnvelope:
@@ -371,7 +385,7 @@ class JobEnvelope:
 
         Deliberately lenient: an api that predates bring-your-own-storage sends
         none of these keys, and that can only mean an asset input with no
-        destination, nothing billed and no cache hit.
+        destination, nothing billed, no cache hit and a live (not test) key.
         """
         raw_input = opt_mapping(data.get("input"))
         kind: Literal["asset", "url"] = (
@@ -384,6 +398,7 @@ class JobEnvelope:
             credit_cost=opt_int(data, "creditCost") or 0,
             cached=opt_bool(data, "cached") or False,
             delivery_only=opt_bool(data, "deliveryOnly") or False,
+            test=opt_bool(data, "test") or False,
         )
 
 
@@ -402,6 +417,8 @@ class JobView:
     """True when the result was served from the cache rather than by running a provider."""
     delivery_only: bool = False
     """True for a job that exists only to deliver an already-cached result to a new destination."""
+    test: bool = False
+    """True for a job made with an `sk_test_` key: free, and the result is a placeholder."""
 
     @property
     def state(self) -> JobState:
@@ -467,7 +484,27 @@ def _envelope_kwargs(envelope: JobEnvelope) -> dict[str, Any]:
         "credit_cost": envelope.credit_cost,
         "cached": envelope.cached,
         "delivery_only": envelope.delivery_only,
+        "test": envelope.test,
     }
+
+
+@dataclass(frozen=True, kw_only=True)
+class JobListItem(JobView):
+    """One row of `list_jobs()`: a :class:`JobView` plus when the job was created."""
+
+    created_at: str
+    """ISO-8601 creation instant. The list is newest first."""
+
+    @classmethod
+    def from_list_entry(cls, value: object, source: str) -> JobListItem:
+        """Parse one `jobs[]` entry of `GET /jobs?limit=`."""
+        data = req_mapping(value, source, "jobs[]")
+        return cls(
+            job_id=req_str(data, "jobId", source),
+            status=JobStatus.from_wire(data, source),
+            created_at=req_str(data, "createdAt", source),
+            **_envelope_kwargs(JobEnvelope.from_wire(data)),
+        )
 
 
 @dataclass(frozen=True)
@@ -491,6 +528,8 @@ class CreateJobResult:
     """
     delivery_only: bool = False
     """True for a job that exists only to deliver an already-cached result to a new destination."""
+    test: bool = False
+    """True for a job made with an `sk_test_` key: free, and the result is a placeholder."""
 
     @property
     def state(self) -> JobState:
@@ -508,6 +547,7 @@ class CreateJobResult:
             credit_cost=self.credit_cost,
             cached=self.cached,
             delivery_only=self.delivery_only,
+            test=self.test,
         )
 
     @classmethod
@@ -558,6 +598,8 @@ class RunResult:
     """Credits debited for this job. 0 for a free op, a cache hit or an unmetered caller."""
     cached: bool = False
     """True when the result was served from the cache rather than by running a provider."""
+    test: bool = False
+    """True for a job made with an `sk_test_` key: free, and the result is a placeholder."""
 
 
 @dataclass(frozen=True)
@@ -885,4 +927,94 @@ class EmbedToken:
         return cls(
             token=req_str(data, "token", source),
             expires_at=req_str(data, "expiresAt", source),
+        )
+
+
+# --------------------------------------------------------------------------
+# account
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AccountKey:
+    """The secret key that made the call, and whether it is a live or a test key."""
+
+    id: str
+    mode: Literal["live", "test"]
+
+
+@dataclass(frozen=True)
+class Account:
+    """`GET /account`: who a secret key belongs to, its balance and the key's mode."""
+
+    account_id: str
+    email: str | None
+    plan: str
+    credits: int
+    """The credit balance."""
+    key: AccountKey
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> Account:
+        """Parse a `GET /account` body."""
+        data = req_mapping(value, source)
+        key = req_mapping(data.get("key"), source, "key")
+        mode: Literal["live", "test"] = "test" if key.get("mode") == "test" else "live"
+        return cls(
+            account_id=req_str(data, "accountId", source),
+            email=opt_str(data, "email"),
+            plan=req_str(data, "plan", source),
+            credits=opt_int(data, "credits") or 0,
+            key=AccountKey(id=req_str(key, "id", source), mode=mode),
+        )
+
+
+# --------------------------------------------------------------------------
+# webhook endpoints
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WebhookEndpoint:
+    """A registered webhook url. No read ever returns its signing secret."""
+
+    id: str
+    account_id: str
+    url: str
+    events: list[str]
+    """Subscribed event types (see :data:`WebhookEndpointEvent`); kept open for new ones."""
+    active: bool
+    created_at: str
+    updated_at: str
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> WebhookEndpoint:
+        """Parse one webhook endpoint."""
+        data = req_mapping(value, source, "endpoint")
+        events = req_list(data.get("events"), source, "events")
+        return cls(
+            id=req_str(data, "id", source),
+            account_id=req_str(data, "accountId", source),
+            url=req_str(data, "url", source),
+            events=[event for event in events if isinstance(event, str)],
+            active=data.get("active") is True,
+            created_at=req_str(data, "createdAt", source),
+            updated_at=req_str(data, "updatedAt", source),
+        )
+
+
+@dataclass(frozen=True)
+class WebhookEndpointCreated:
+    """A new endpoint plus its signing secret — shown here and on rotate only."""
+
+    endpoint: WebhookEndpoint
+    secret: str
+
+    @classmethod
+    def from_wire(cls, value: object, source: str) -> WebhookEndpointCreated:
+        """Parse `POST /webhook-endpoints` (`{ endpoint, secret }`)."""
+        data = req_mapping(value, source)
+        return cls(
+            endpoint=WebhookEndpoint.from_wire(data.get("endpoint"), source),
+            secret=req_str(data, "secret", source),
         )

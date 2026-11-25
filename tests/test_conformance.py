@@ -34,6 +34,7 @@ from snapnedit import (
     SnapneditError,
     UrlInput,
     Webhooks,
+    credit_cost,
 )
 
 IMPLEMENTED: set[str] = set()
@@ -712,7 +713,9 @@ def test_uploads_unsupported_mime(conformance: Conformance, scenario_id: str):
     assert caught.value.code is ErrorCode.UNSUPPORTED_MIME
 
     accepted = sorted({mime for op in snap.list_operations() for mime in op.accept})
-    assert accepted == ["image/avif", "image/heic", "image/heif", "image/jpeg", "image/png", "image/webp"]
+    assert accepted == [
+        "image/avif", "image/heic", "image/heif", "image/jpeg", "image/png", "image/webp"
+    ]
 
 
 # ---------------------------------------------------------------- embed --
@@ -816,6 +819,154 @@ def test_openapi_document(conformance: Conformance, scenario_id: str):
     assert response.text == committed
 
 
+# ------------------------------------------------ account & partner API --
+
+
+@scenario("account.get")
+def test_account_get(conformance: Conformance, scenario_id: str):
+    me = conformance.client().get_account()
+    assert me.account_id == conformance.account_id
+    assert me.credits == conformance.balance()
+    assert me.key.mode == "live"
+    assert isinstance(me.key.id, str) and me.key.id
+    assert isinstance(me.plan, str)
+    assert me.email is None or isinstance(me.email, str)
+
+    assert conformance.test_api_key, "the ready line carried no testApiKey"
+    assert conformance.client(conformance.test_api_key).get_account().key.mode == "test"
+
+    with pytest.raises(SnapneditError) as caught:
+        conformance.client(None).get_account()
+    assert caught.value.status == 401
+    assert caught.value.code is ErrorCode.UNAUTHORIZED
+
+    token = conformance.client(None).embed.create_session(
+        conformance.publishable_key, "https://conformance.example"
+    )
+    with pytest.raises(SnapneditError) as caught:
+        conformance.client(token.token).get_account()
+    assert caught.value.status == 401
+    assert caught.value.code is ErrorCode.UNAUTHORIZED
+
+
+@scenario("jobs.list")
+def test_jobs_list(conformance: Conformance, scenario_id: str):
+    snap = conformance.client()
+    asset = snap.upload(conformance.unique_image("jobs-list"))
+    for width in (4, 5):
+        created = snap.create_job("resize-image", asset.asset_id, {"width": width})
+        assert created.http_status == 202
+        assert snap.wait_for_job(created.job_id, **POLL).state == "succeeded"
+
+    jobs = snap.list_jobs(limit=2)
+    assert len(jobs) == 2
+    for item in jobs:
+        assert item.job_id
+        instant(item.created_at)  # raises if not ISO 8601
+        assert isinstance(item.test, bool)
+    assert instant(jobs[0].created_at) >= instant(jobs[1].created_at)
+
+    # The SDK reads the envelope leniently, so pin the wire fields on the raw body.
+    raw = conformance.raw.get("/jobs", params={"limit": 2}, headers=auth(conformance))
+    assert raw.status_code == 200
+    for item in raw.json()["jobs"]:
+        for name in ("jobId", "createdAt", "state", "input", "destination", "delivery",
+                     "creditCost", "cached", "deliveryOnly", "priority", "idempotencyKey",
+                     "test"):
+            assert name in item, name
+
+    succeeded = snap.list_jobs(limit=1, status="succeeded")
+    assert len(succeeded) <= 1
+    assert all(item.state == "succeeded" for item in succeeded)
+
+    for limit in (0, 101):
+        with pytest.raises(SnapneditError) as caught:
+            snap.list_jobs(limit=limit)
+        assert caught.value.status == 400
+        assert caught.value.code is ErrorCode.INVALID_INPUT
+
+    count = conformance.raw.get("/jobs", headers=auth(conformance))
+    assert count.status_code == 200
+    assert sorted(count.json().keys()) == ["count", "priority", "status"]
+
+    with pytest.raises(SnapneditError) as caught:
+        conformance.client(None).list_jobs(limit=1)
+    assert caught.value.status == 401
+
+
+@scenario("webhook-endpoints.crud")
+def test_webhook_endpoints_crud(conformance: Conformance, scenario_id: str):
+    hooks = conformance.client().webhook_endpoints
+    created = hooks.create("https://hooks.conformance.example/x")
+    endpoint, secret = created.endpoint, created.secret
+    assert endpoint.events == ["job.succeeded", "job.failed", "session.ended"]
+    assert endpoint.active is True
+    assert endpoint.created_at and endpoint.updated_at
+    assert secret
+
+    assert endpoint.id in [row.id for row in hooks.list()]
+    listed = conformance.raw.get("/webhook-endpoints", headers=auth(conformance))
+    assert listed.status_code == 200
+    assert secret not in listed.text
+
+    assert hooks.set_active(endpoint.id, False).active is False
+
+    rotated = hooks.rotate_secret(endpoint.id)
+    assert rotated and rotated != secret
+
+    hooks.delete(endpoint.id)
+    with pytest.raises(SnapneditError) as caught:
+        hooks.delete(endpoint.id)
+    assert caught.value.status == 404
+    assert caught.value.code is ErrorCode.NOT_FOUND
+
+    bad: list[tuple[str, Any]] = [
+        ("http://hooks.conformance.example/x", None),
+        ("https://10.0.0.1/x", None),
+        ("https://hooks.conformance.example/x", ["job.done"]),
+    ]
+    for url, events in bad:
+        with pytest.raises(SnapneditError) as caught:
+            if events is None:
+                hooks.create(url)
+            else:
+                hooks.create(url, events=events)
+        assert caught.value.status == 400, url
+        assert caught.value.code is ErrorCode.INVALID_INPUT
+
+    with pytest.raises(SnapneditError) as caught:
+        conformance.client(None).webhook_endpoints.list()
+    assert caught.value.status == 401
+
+
+@scenario("keys.test-mode")
+def test_keys_test_mode(conformance: Conformance, scenario_id: str):
+    assert conformance.test_api_key, "the ready line carried no testApiKey"
+    snap = conformance.client()
+    test_snap = conformance.client(conformance.test_api_key)
+    before = conformance.balance()
+    asset = snap.upload(conformance.unique_image("test-mode"))
+
+    first = test_snap.create_job("upscale", asset.asset_id)
+    assert first.http_status == 202
+    assert (first.credit_cost, first.cached, first.test) == (0, False, True)
+    done = test_snap.wait_for_job(first.job_id, **POLL)
+    assert done.state == "succeeded"
+    assert done.test is True
+    assert done.download is not None
+
+    second = test_snap.create_job("upscale", asset.asset_id)
+    assert second.http_status == 202
+    assert (second.cached, second.test) == (False, True)
+
+    live = snap.create_job("upscale", asset.asset_id)
+    assert live.http_status == 202
+    assert (live.cached, live.test) == (False, False)
+    assert live.credit_cost == credit_cost("upscale")
+    assert snap.wait_for_job(live.job_id, **POLL).state == "succeeded"
+    assert conformance.balance() == before - live.credit_cost
+
+
 # ------------------------------------------------------------- coverage --
 
 
@@ -842,4 +993,4 @@ def test_every_scenario_in_scenarios_json_is_implemented(scenarios: dict[str, An
     """A new scenario upstream shows up here as a red test, not as silence."""
     assert scenarios["version"] == 1
     assert sorted(IMPLEMENTED) == sorted(entry["id"] for entry in scenarios["scenarios"])
-    assert len(IMPLEMENTED) == 25
+    assert len(IMPLEMENTED) == 29

@@ -16,11 +16,15 @@ from ._transport import Request
 from ._wire import req_list, req_mapping, req_str
 from .models import (
     UNSET,
+    Account,
     CreateJobResult,
     Destination,
     DestinationPresign,
     DestinationTestResult,
     EmbedToken,
+    JobListItem,
+    JobPriority,
+    JobState,
     JobView,
     OperationMetadata,
     SignedUrl,
@@ -31,6 +35,9 @@ from .models import (
     UsageInstant,
     UsageReport,
     UsageSource,
+    WebhookEndpoint,
+    WebhookEndpointCreated,
+    WebhookEndpointEvent,
     destination_to_wire,
 )
 
@@ -42,12 +49,18 @@ __all__ = [
     "create_embed_token",
     "create_job",
     "create_upload",
+    "create_webhook_endpoint",
     "delete_destination",
+    "delete_webhook_endpoint",
     "download",
+    "get_account",
     "get_job",
     "get_usage",
     "list_destinations",
+    "list_jobs",
     "list_operations",
+    "list_webhook_endpoints",
+    "parse_account",
     "parse_confirm_upload",
     "parse_create_job",
     "parse_create_upload",
@@ -57,10 +70,17 @@ __all__ = [
     "parse_destination_test",
     "parse_embed_token",
     "parse_job",
+    "parse_job_list",
     "parse_operations",
     "parse_usage",
+    "parse_webhook_endpoint",
+    "parse_webhook_endpoint_created",
+    "parse_webhook_endpoint_list",
+    "parse_webhook_secret",
     "presign_destination_upload",
     "render_design",
+    "rotate_webhook_secret",
+    "set_webhook_endpoint_active",
     "test_destination",
     "update_destination",
 ]
@@ -188,6 +208,30 @@ def parse_job(payload: Any, url: str, job_id: str) -> JobView:
     return JobView.from_wire(job_id, payload, url)
 
 
+def list_jobs(
+    *,
+    limit: int = 20,
+    status: JobState | None = None,
+    priority: JobPriority | None = None,
+) -> Request:
+    """`GET /jobs?limit=` — the newest jobs. Without `limit` the api answers a count instead."""
+    query: list[tuple[str, str]] = [("limit", str(limit))]
+    if status is not None:
+        query.append(("status", status))
+    if priority is not None:
+        query.append(("priority", priority))
+    return Request("GET", f"/jobs?{urlencode(query)}")
+
+
+def parse_job_list(payload: Any, url: str) -> list[JobListItem]:
+    """Parse `{ jobs: [...] }`."""
+    data = req_mapping(payload, url)
+    return [
+        JobListItem.from_list_entry(entry, url)
+        for entry in req_list(data.get("jobs"), url, "jobs")
+    ]
+
+
 def download(signed: SignedUrl | str) -> Request:
     """Fetch result bytes from a presigned url (a same-origin path, usually)."""
     return Request(
@@ -255,6 +299,80 @@ def get_usage(
 def parse_usage(payload: Any, url: str) -> UsageReport:
     """Parse the usage report."""
     return UsageReport.from_wire(payload, url)
+
+
+# --------------------------------------------------------------------------
+# account
+# --------------------------------------------------------------------------
+
+
+def get_account() -> Request:
+    """`GET /account` — secret keys only; an embed token is `401`."""
+    return Request("GET", "/account")
+
+
+def parse_account(payload: Any, url: str) -> Account:
+    """Parse the account."""
+    return Account.from_wire(payload, url)
+
+
+# --------------------------------------------------------------------------
+# webhook endpoints
+# --------------------------------------------------------------------------
+
+
+def list_webhook_endpoints() -> Request:
+    """`GET /webhook-endpoints`."""
+    return Request("GET", "/webhook-endpoints")
+
+
+def parse_webhook_endpoint_list(payload: Any, url: str) -> list[WebhookEndpoint]:
+    """Parse `{ endpoints: [...] }`."""
+    data = req_mapping(payload, url)
+    return [
+        WebhookEndpoint.from_wire(entry, url)
+        for entry in req_list(data.get("endpoints"), url, "endpoints")
+    ]
+
+
+def create_webhook_endpoint(
+    url: str, events: Sequence[WebhookEndpointEvent] | UnsetType = UNSET
+) -> Request:
+    """`POST /webhook-endpoints` — omitting `events` subscribes to every event."""
+    body = _body(url=url, events=events if isinstance(events, UnsetType) else list(events))
+    return Request("POST", "/webhook-endpoints", json_body=body, headers=_JSON)
+
+
+def parse_webhook_endpoint_created(payload: Any, url: str) -> WebhookEndpointCreated:
+    """Parse `{ endpoint, secret }`."""
+    return WebhookEndpointCreated.from_wire(payload, url)
+
+
+def set_webhook_endpoint_active(endpoint_id: str, active: bool) -> Request:
+    """`PATCH /webhook-endpoints/{id}` — pause or resume deliveries."""
+    return Request(
+        "PATCH", f"/webhook-endpoints/{endpoint_id}", json_body={"active": active}, headers=_JSON
+    )
+
+
+def parse_webhook_endpoint(payload: Any, url: str) -> WebhookEndpoint:
+    """Parse `{ endpoint: {...} }`."""
+    return WebhookEndpoint.from_wire(req_mapping(payload, url).get("endpoint"), url)
+
+
+def delete_webhook_endpoint(endpoint_id: str) -> Request:
+    """`DELETE /webhook-endpoints/{id}` — 204, no body."""
+    return Request("DELETE", f"/webhook-endpoints/{endpoint_id}")
+
+
+def rotate_webhook_secret(endpoint_id: str) -> Request:
+    """`POST /webhook-endpoints/{id}/rotate` — mint a new signing secret."""
+    return Request("POST", f"/webhook-endpoints/{endpoint_id}/rotate")
+
+
+def parse_webhook_secret(payload: Any, url: str) -> str:
+    """Parse `{ secret }`."""
+    return req_str(req_mapping(payload, url), "secret", url)
 
 
 # --------------------------------------------------------------------------

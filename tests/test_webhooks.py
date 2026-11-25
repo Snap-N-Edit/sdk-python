@@ -10,7 +10,9 @@ import pytest
 from snapnedit import (
     WEBHOOK_SIGNATURE_HEADER,
     SnapneditSignatureError,
+    WebhookJobData,
     Webhooks,
+    WebhookSessionData,
 )
 
 SECRET = "whsec_conformance_fixed_test_vector"
@@ -126,3 +128,40 @@ def test_construct_event_parses_a_failed_delivery_envelope():
     assert event.data.destination is not None and event.data.destination.type == "presigned-put"
     assert event.data.delivery is not None and event.data.delivery.status == "failed"
     assert event.data.delivery.attempts == 3
+
+
+def _signed(body: str) -> str:
+    return f"t=1,v1={hmac.new(SECRET.encode(), f'1.{body}'.encode(), hashlib.sha256).hexdigest()}"
+
+
+def test_construct_event_parses_session_ended():
+    body = (
+        '{"id":"whd_3","type":"session.ended","created":1,"data":{"status":"ended",'
+        '"sessionId":"s-1","apiKeyId":"k-1","origin":"https://host.example","endUserId":null,'
+        '"startedAt":"2026-11-25T00:00:00.000Z","endedAt":"2026-11-25T01:00:00.000Z",'
+        '"refreshes":3,"jobs":4,"credits":5}}'
+    )
+    event = Webhooks.construct_event(body, _signed(body), SECRET)
+    assert isinstance(event.data, WebhookSessionData)
+    assert event.data.session_id == "s-1"
+    assert event.data.end_user_id is None
+    assert (event.data.refreshes, event.data.jobs, event.data.credits) == (3, 4, 5)
+
+
+def test_an_unknown_event_type_parses_without_data():
+    body = '{"id":"whd_4","type":"account.updated","created":1,"data":{"anything":true}}'
+    event = Webhooks.construct_event(body, _signed(body), SECRET)
+    assert event.type == "account.updated"
+    assert event.data is None
+    assert event.raw["data"] == {"anything": True}
+
+
+def test_a_job_event_carries_the_test_flag():
+    body = (
+        '{"id":"whd_5","type":"job.failed","created":1,"data":{"jobId":"j",'
+        '"operation":"upscale","status":"failed","errorCode":"provider_failed",'
+        '"message":"x","input":{"kind":"asset"},"destination":null,"delivery":null,"test":true}}'
+    )
+    event = Webhooks.construct_event(body, _signed(body), SECRET)
+    assert isinstance(event.data, WebhookJobData)
+    assert event.data.test is True
